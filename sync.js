@@ -1,21 +1,27 @@
-// /sync.js — V2.4: auth-aware + auto-migrate + reconcile (server-wins) + safe autosave
+// /sync.js — V2.4R: auth-aware + auto-migrate + reconcile (server-wins) + safe autosave + reload on pull
 (async () => {
-  const NS = "SUPA_SYNC_V24"; if (window[NS]) return; window[NS] = true;
+  const NS = "SUPA_SYNC_V24R";               // bump to avoid old cache
+  if (window[NS]) return; window[NS] = true;
 
+  // --- small utils ----------------------------------------------------------
   const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
   const STORAGE_KEY = window.STORAGE_KEY || "yield_focus_v2";
   const j = (o)=>JSON.stringify(o||{});
   const parse = (s)=>{ try { return JSON.parse(s); } catch { return {}; } };
-  const getLocal = () => typeof window.state !== "undefined"
+  const getLocal = () => (typeof window.state !== "undefined")
     ? window.state
     : parse(localStorage.getItem(STORAGE_KEY) || "{}");
+  const signature = (s)=> s ? (s.length+":"+s.slice(0,64)+":"+s.slice(-64)) : "0:";
 
-  // Block pushes while we’re restoring/reconciling
+  // Block pushes while we’re restoring/reconciling (and right after reload)
   let suppressPush = true;
-  let lastSig = ""; // signature of last-pushed local JSON
-  const signature = (s) => s ? (s.length+":"+s.slice(0,64)+":"+s.slice(-64)) : "0:";
+  let lastSig = signature(localStorage.getItem(STORAGE_KEY)||"");
+  if (sessionStorage.getItem("cloud_restoring")==="1") {
+    suppressPush = true;
+    setTimeout(()=>{ suppressPush=false; sessionStorage.removeItem("cloud_restoring"); }, 1500);
+  }
 
-  // Reuse page client if present; else create one
+  // --- Supabase client ------------------------------------------------------
   let supabase = window.supabase;
   for (let i=0;i<30 && !supabase;i++){ await wait(100); supabase = window.supabase; }
   if (!supabase) {
@@ -27,13 +33,13 @@
     window.supabase = supabase;
   }
 
-  // IDs
+  // --- IDs ------------------------------------------------------------------
   let session = (await supabase.auth.getSession()).data?.session || null;
   const userId   = session?.user?.id || null;
   const deviceId = localStorage.getItem("mc_device_id") || (localStorage.setItem("mc_device_id", crypto.randomUUID()), localStorage.getItem("mc_device_id"));
   let rowId = userId || deviceId;
 
-  // Supabase helpers
+  // --- server helpers -------------------------------------------------------
   async function fetchServer(id){
     const { data, error } = await supabase
       .from("cloud_store").select("data, updated_at").eq("id", id).maybeSingle();
@@ -41,24 +47,25 @@
   }
 
   function applyServer(data, updated_at){
-    // write server -> local; keep pushes blocked for a moment while app settles
+    // Write server -> local and force reload so UI boots from server state
     suppressPush = true;
+    sessionStorage.setItem("cloud_restoring","1");  // survive the reload
     window.state = data;
     const s = j(data);
     localStorage.setItem(STORAGE_KEY, s);
     localStorage.setItem("cloud_updated_at", updated_at || new Date().toISOString());
     lastSig = signature(s);
     (window.save||(()=>{}))();
-    // Allow app to boot fully before enabling pushes (prevents immediate overwrite)
-    setTimeout(()=>{ suppressPush = false; }, 1500);
+    location.reload();                              // << important
   }
 
+  // --- push / pull ----------------------------------------------------------
   async function push(){
     if (suppressPush) return;
     const payload = getLocal();
     const s = j(payload);
     const sig = signature(s);
-    if (sig === lastSig) return; // nothing changed -> don't spam pushes
+    if (sig === lastSig) return;                    // no change
     const { error } = await supabase
       .from("cloud_store")
       .upsert({ id: rowId, owner: userId||null, data: payload, updated_at: new Date().toISOString() }, { onConflict:"id" });
@@ -70,13 +77,13 @@
   async function pull(id=rowId){
     const srv = await fetchServer(id);
     if (srv.error) { console.error("[cloud-sync] pull error", srv.error); return false; }
-    if (!srv.data) { console.log("[cloud-sync] nothing to pull"); return false; }
+    if (!srv.data)  { console.log("[cloud-sync] nothing to pull"); return false; }
     console.log("[cloud-sync] pulling server copy");
     applyServer(srv.data, srv.updated_at);
     return true;
   }
 
-  // --- Hook app saves and localStorage writes (but respect suppression) -----
+  // --- hook app save + localStorage writes (respect suppression) ------------
   for (let i=0;i<100 && typeof window.save!=="function" && typeof window.state==="undefined"; i++) await wait(100);
   if (typeof window.save==="function" && !window.save.__wrapped_for_cloud__) {
     const _save = window.save;
@@ -96,7 +103,7 @@
     localStorage.__cloud_wrapped__ = true;
   }
 
-  // --- Reconcile on load: if signed in and server != local, SERVER WINS -----
+  // --- reconcile on load (SERVER WINS when signed in) -----------------------
   (async ()=>{
     const localStr = j(getLocal());
     lastSig = signature(localStr);
@@ -109,21 +116,19 @@
         const newer  = srv.updated_at && (!localStorage.getItem("cloud_updated_at") || new Date(srv.updated_at) > new Date(localStorage.getItem("cloud_updated_at")));
         const bigger = srvStr.length > localStr.length; // any bigger at all
         if (differ && (newer || bigger)){
-          console.log("[cloud-sync] reconcile: server>local (", { newer, bigger }, ") → pulling");
-          applyServer(srv.data, srv.updated_at);
-          return; // keep suppression true for a moment; no immediate push
+          console.log("[cloud-sync] reconcile: server>local → pulling");
+          applyServer(srv.data, srv.updated_at);  // reloads; pushes unblocked after reload via sessionStorage timer
+          return;
         }
       }
-      // Signed-in but no server data yet: keep local if present; else nothing to pull
-      suppressPush = false;
+      suppressPush = false;                        // ok to push after brief init
     } else {
-      // Not signed in: if local empty, try device row
       if (!localStorage.getItem(STORAGE_KEY)) await pull(deviceId);
       suppressPush = false;
     }
   })();
 
-  // --- Auto-migrate device → user on sign-in, then reconcile again ----------
+  // --- migrate device → user on sign-in, then reconcile again ---------------
   supabase.auth.onAuthStateChange(async (event, newSession) => {
     if (event === "SIGNED_IN" && newSession?.user?.id) {
       session = newSession;
@@ -139,13 +144,12 @@
         localStorage.setItem("mc_device_id", newUserId);
         console.log("[cloud-sync] switched to user id", newUserId);
       }
-      // After login, if server != local, SERVER WINS
       const srv = await fetchServer(newUserId);
       if (srv.data){
         const srvStr = j(srv.data), locStr = j(getLocal());
         if (srvStr !== locStr) {
           console.log("[cloud-sync] reconcile after login → pulling");
-          applyServer(srv.data, srv.updated_at);
+          applyServer(srv.data, srv.updated_at);   // reloads
           return;
         }
       }
@@ -153,7 +157,7 @@
     }
   });
 
-  // Debug / manual
+  // --- manual/debug ---------------------------------------------------------
   window.__cloud = { push, pull, id: rowId };
   console.log("[cloud-sync] ready", window.__cloud);
 })();
