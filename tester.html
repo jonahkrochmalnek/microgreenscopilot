@@ -1,0 +1,102 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Cloud Sync Tester</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: ui-sans-serif,system-ui,Segoe UI,Arial; max-width: 720px; margin: 24px auto; }
+    input, button { font-size: 16px; padding: 8px 10px; }
+    .row { display:flex; gap:8px; margin:8px 0; }
+    .col { display:flex; flex-direction:column; gap:8px; }
+    pre { background:#111; color:#0f0; padding:10px; border-radius:8px; max-height:220px; overflow:auto; }
+    .ok{color:#0a0} .bad{color:#c00}
+  </style>
+
+  <!-- Supabase client -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <!-- Your cloud sync -->
+  <script src="/sync.js?v=27"></script>
+</head>
+<body>
+  <h1>Cloud Sync Tester</h1>
+
+  <div class="row">
+    <input id="email" placeholder="email" style="flex:1">
+    <input id="pass" type="password" placeholder="password" style="flex:1">
+    <button id="login">Sign in</button>
+    <button id="logout">Sign out</button>
+  </div>
+
+  <div class="row">
+    <input id="variety" placeholder="new product name (e.g., zz-sync-check-7)" style="flex:1">
+    <button id="add">Add product (local)</button>
+    <button id="push">Push</button>
+    <button id="pull">Pull</button>
+  </div>
+
+  <div class="row">
+    <button id="showLocal">Show local</button>
+    <button id="showServer">Show server</button>
+  </div>
+
+  <pre id="log"></pre>
+
+<script>
+const log = (...a)=>{ const el=document.getElementById('log'); el.textContent += a.join(' ')+"\n"; el.scrollTop=el.scrollHeight; };
+
+const url = "https://glxzjcqbvyimlwlyauws.supabase.co";
+const anon= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdseHpqY3FidnlpbWx3bHlhdXdzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTYxMzc1NjQsImV4cCI6MjA3MTcxMzU2NH0.L_Dfhz_ZxVIC2i7B55ZpZALSrgR7JffPwwRtJLn6Wbo";
+const supa = window.supabase?.createClient ? window.supabase.createClient(url, anon) : null;
+
+const KEY = "yield_focus_v2";
+
+async function getUser(){ const { data } = await supa.auth.getUser(); return data.user || null; }
+function readLocal(){ try { return JSON.parse(localStorage.getItem(KEY)||"{}"); } catch { return {}; } }
+function writeLocal(obj){ localStorage.setItem(KEY, JSON.stringify(obj||{})); }
+
+document.getElementById('login').onclick = async ()=>{
+  const email = document.getElementById('email').value.trim();
+  const pass  = document.getElementById('pass').value;
+  const { data, error } = await supa.auth.signInWithPassword({ email, password: pass });
+  if (error) log("signin error:", error.message); else log("signed in:", data.user.id);
+};
+document.getElementById('logout').onclick = async ()=>{
+  await supa.auth.signOut(); log("signed out");
+};
+
+document.getElementById('add').onclick = ()=>{
+  const name = document.getElementById('variety').value.trim();
+  if (!name) return;
+  const obj = readLocal();
+  obj.products = obj.products || [];
+  obj.products.push({ name });
+  writeLocal(obj);
+  log("local add:", name, "count=", obj.products.length);
+};
+document.getElementById('push').onclick = async ()=>{
+  if (!window.__cloud) return log("no __cloud (sync.js not running)");
+  await window.__cloud.push();
+  log("pushed");
+};
+document.getElementById('pull').onclick = async ()=>{
+  if (!window.__cloud) return log("no __cloud (sync.js not running)");
+  await window.__cloud.pull();
+  log("pulled");
+};
+document.getElementById('showLocal').onclick = ()=>{
+  const obj = readLocal(); log("LOCAL:", JSON.stringify(obj.products||[], null, 2));
+};
+document.getElementById('showServer').onclick = async ()=>{
+  const user = await getUser();
+  if (!user) return log("not signed in; server === device row; open another tab and sign in to see user row");
+  const { data, error } = await supa.from("cloud_store").select("id, data, updated_at").eq("id", user.id).maybeSingle();
+  if (error) log("server error:", error.message);
+  else log("SERVER:", JSON.stringify((data?.data?.products)||[], null, 2), "updated_at:", data?.updated_at);
+};
+
+log(location.href.includes('v=') ? "cache-bust OK" : "tip: open tester.html?v=1 to bust cache");
+log(typeof window.__cloud === 'object' ? "sync.js loaded ✔︎" : "sync.js missing ✖︎");
+</script>
+</body>
+</html>
