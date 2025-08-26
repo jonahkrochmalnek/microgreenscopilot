@@ -1,9 +1,9 @@
-// /sync.js — V2.5: server-wins, reload-on-pull, safe autosave, no guards
+// /sync.js — V2.6 (stable): server-wins, single reload on pull, no Edge injection
 (async () => {
-  const NS = "SUPA_SYNC_V25";
+  const NS = "SUPA_SYNC_V26";
   if (window[NS]) return; window[NS] = true;
 
-  // Utilities
+  // --- utils
   const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
   const STORAGE_KEY = window.STORAGE_KEY || "yield_focus_v2";
   const toJSON = (o)=>JSON.stringify(o||{});
@@ -13,12 +13,12 @@
     : fromJSON(localStorage.getItem(STORAGE_KEY)||"{}");
   const sig = (s)=> s ? (s.length+":"+s.slice(0,64)+":"+s.slice(-64)) : "0:";
 
-  // After a restore we suppress pushes briefly so the app can boot cleanly
+  // After a restore we briefly block pushes so the app boots cleanly
   let suppressPush = sessionStorage.getItem("cloud_restoring")==="1";
-  if (suppressPush) setTimeout(()=>{ suppressPush=false; sessionStorage.removeItem("cloud_restoring"); }, 1500);
+  if (suppressPush) setTimeout(()=>{ suppressPush=false; sessionStorage.removeItem("cloud_restoring"); }, 1200);
   let lastSig = sig(localStorage.getItem(STORAGE_KEY)||"");
 
-  // Supabase client (reuse if the page already has one)
+  // --- Supabase client (reuse if page has one)
   let supabase = window.supabase;
   for (let i=0;i<30 && !supabase;i++){ await wait(100); supabase = window.supabase; }
   if (!supabase) {
@@ -30,28 +30,47 @@
     window.supabase = supabase;
   }
 
-  // IDs
+  // --- IDs
   let session = (await supabase.auth.getSession()).data?.session || null;
   const userId   = session?.user?.id || null;
   const deviceId = localStorage.getItem("mc_device_id") || (localStorage.setItem("mc_device_id", crypto.randomUUID()), localStorage.getItem("mc_device_id"));
   let rowId = userId || deviceId;
 
-  // DB helpers
+  // --- DB helpers
   async function fetchServer(id){
     const { data, error } = await supabase.from("cloud_store").select("data,updated_at").eq("id", id).maybeSingle();
     return { data: data?.data, updated_at: data?.updated_at, error };
   }
+  async function upsert(id, payload){
+    return await supabase.from("cloud_store").upsert(
+      { id, owner: userId||null, data: payload, updated_at: new Date().toISOString() },
+      { onConflict: "id" }
+    );
+  }
 
   function applyServer(data, updated_at){
-    // Write server -> local and reload so the UI boots from server state.
+    // Reload at most once every 3s to avoid loops
+    const now = Date.now();
+    const last = +sessionStorage.getItem("cloud_last_reload_ts") || 0;
+    if (now - last < 3000) {
+      // No reload: just write locally
+      window.state = data;
+      const s = toJSON(data);
+      localStorage.setItem(STORAGE_KEY, s);
+      localStorage.setItem("cloud_updated_at", updated_at || new Date().toISOString());
+      lastSig = sig(s);
+      (window.save||(()=>{}))();
+      return;
+    }
     suppressPush = true;
     sessionStorage.setItem("cloud_restoring","1");
+    sessionStorage.setItem("cloud_last_reload_ts", String(now));
     window.state = data;
     const s = toJSON(data);
     localStorage.setItem(STORAGE_KEY, s);
     localStorage.setItem("cloud_updated_at", updated_at || new Date().toISOString());
     lastSig = sig(s);
-    (window.save||(()=>{}))();    // in case app listens to it
+    (window.save||(()=>{}))();
     location.reload();
   }
 
@@ -60,15 +79,12 @@
     const payload = getLocal();
     const s = toJSON(payload);
     const sSig = sig(s);
-    if (sSig === lastSig) return; // nothing changed
-    const { error } = await supabase
-      .from("cloud_store")
-      .upsert({ id: rowId, owner: userId||null, data: payload, updated_at: new Date().toISOString() }, { onConflict:"id" });
+    if (sSig === lastSig) return;
+    const { error } = await upsert(rowId, payload);
     if (error) { console.error("[cloud-sync] push error", error); return; }
     lastSig = sSig;
     console.log("[cloud-sync] pushed", { id: rowId, bytes: s.length });
   }
-
   async function pull(id=rowId){
     const srv = await fetchServer(id);
     if (srv.error) { console.error("[cloud-sync] pull error", srv.error); return false; }
@@ -78,11 +94,11 @@
     return true;
   }
 
-  // Hook app save + localStorage writes (respect suppression)
-  for (let i=0;i<100 && typeof window.save!=="function" && typeof window.state==="undefined"; i++) await wait(100);
+  // --- hook app saves & local writes
+  for (let i=0;i<150 && typeof window.save!=="function" && typeof window.state==="undefined"; i++) await wait(100);
   if (typeof window.save==="function" && !window.save.__wrapped_for_cloud__) {
     const _save = window.save;
-    window.save = function(){ const r=_save.apply(this,arguments); if (!suppressPush){ clearTimeout(window.__supaPushT); window.__supaPushT=setTimeout(push,300); } return r; };
+    window.save = function(){ const r=_save.apply(this,arguments); if (!suppressPush){ clearTimeout(window.__supaPushT); window.__supaPushT=setTimeout(push,400);} return r; };
     window.save.__wrapped_for_cloud__ = true;
   }
   if (!localStorage.__cloud_wrapped__) {
@@ -91,30 +107,35 @@
       const before = localStorage.getItem(k);
       const r = _set(k,v);
       if (k===STORAGE_KEY && !suppressPush && before !== v){
-        clearTimeout(window.__supaPushT); window.__supaPushT=setTimeout(push,300);
+        clearTimeout(window.__supaPushT); window.__supaPushT=setTimeout(push,400);
       }
       return r;
     };
     localStorage.__cloud_wrapped__ = true;
   }
+  addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="hidden") push(); });
 
-  // Reconcile on load: SERVER WINS if signed in
+  // --- reconcile on load (SERVER WINS when signed in)
   (async ()=>{
-    const localStr = toJSON(getLocal());
+    const localObj = getLocal();
+    const localStr = toJSON(localObj);
     lastSig = sig(localStr);
 
     if (userId){
       const srv = await fetchServer(userId);
-      if (!srv.error && srv.data){
+      if (srv.data){
         const srvStr = toJSON(srv.data);
         const differ = srvStr !== localStr;
         const newer  = srv.updated_at && (!localStorage.getItem("cloud_updated_at") || new Date(srv.updated_at) > new Date(localStorage.getItem("cloud_updated_at")));
-        const bigger = srvStr.length > localStr.length;
+        const bigger = srvStr.length > localStr.length + 50;
         if (differ && (newer || bigger)){
           console.log("[cloud-sync] reconcile: server>local → pulling");
-          applyServer(srv.data, srv.updated_at);  // reloads
+          applyServer(srv.data, srv.updated_at);
           return;
         }
+      } else if (localStr && localStr !== "{}") {
+        console.log("[cloud-sync] create user row from local");
+        await upsert(userId, localObj);
       }
       suppressPush = false;
     } else {
@@ -123,18 +144,14 @@
     }
   })();
 
-  // Migrate device → user on SIGNED_IN, then reconcile again
+  // --- migrate device → user on SIGNED_IN, then reconcile again
   supabase.auth.onAuthStateChange(async (event, newSession) => {
     if (event === "SIGNED_IN" && newSession?.user?.id) {
-      session = newSession;
       const newUserId = newSession.user.id;
       if (rowId !== newUserId) {
         const dev = await fetchServer(rowId);
-        if (dev.data) {
-          await supabase.from("cloud_store").upsert({
-            id:newUserId, owner:newUserId, data:dev.data, updated_at:new Date().toISOString()
-          }, { onConflict:"id" });
-        }
+        const user = await fetchServer(newUserId);
+        if (!user.data && dev.data) await upsert(newUserId, dev.data);
         rowId = newUserId;
         localStorage.setItem("mc_device_id", newUserId);
         console.log("[cloud-sync] switched to user id", newUserId);
@@ -144,7 +161,7 @@
         const srvStr = toJSON(srv.data), locStr = toJSON(getLocal());
         if (srvStr !== locStr) {
           console.log("[cloud-sync] reconcile after login → pulling");
-          applyServer(srv.data, srv.updated_at);   // reloads
+          applyServer(srv.data, srv.updated_at);
           return;
         }
       }
@@ -152,7 +169,7 @@
     }
   });
 
-  // Debug handle
+  // --- debug
   window.__cloud = { push, pull, id: rowId };
   console.log("[cloud-sync] ready", window.__cloud);
 })();
