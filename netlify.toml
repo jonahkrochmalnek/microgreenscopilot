@@ -1,6 +1,7 @@
-[edge_functions]
-  directory = "netlify/edge-functions"
+# Minimal, safe config for Edge Functions
+# (uses the default directory: netlify/edge-functions)
 
 [[edge_functions]]
-  function = "inject-sync"
-  path = "/*"
+function = "inject-sync"
+path = "/*"
+
