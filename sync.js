@@ -1,9 +1,10 @@
-// /sync.js — V2.6 (stable): server-wins, single reload on pull, no Edge injection
+// /sync.js — V2.7 (stable + auto-detect): server-wins, single reload on pull,
+// periodic change detection (every 2s), save hooks, and manual __cloud API.
 (async () => {
-  const NS = "SUPA_SYNC_V26";
+  const NS = "SUPA_SYNC_V27";
   if (window[NS]) return; window[NS] = true;
 
-  // --- utils
+  // --- utils ---------------------------------------------------------------
   const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
   const STORAGE_KEY = window.STORAGE_KEY || "yield_focus_v2";
   const toJSON = (o)=>JSON.stringify(o||{});
@@ -18,7 +19,7 @@
   if (suppressPush) setTimeout(()=>{ suppressPush=false; sessionStorage.removeItem("cloud_restoring"); }, 1200);
   let lastSig = sig(localStorage.getItem(STORAGE_KEY)||"");
 
-  // --- Supabase client (reuse if page has one)
+  // --- Supabase client -----------------------------------------------------
   let supabase = window.supabase;
   for (let i=0;i<30 && !supabase;i++){ await wait(100); supabase = window.supabase; }
   if (!supabase) {
@@ -30,13 +31,13 @@
     window.supabase = supabase;
   }
 
-  // --- IDs
+  // --- IDs -----------------------------------------------------------------
   let session = (await supabase.auth.getSession()).data?.session || null;
   const userId   = session?.user?.id || null;
   const deviceId = localStorage.getItem("mc_device_id") || (localStorage.setItem("mc_device_id", crypto.randomUUID()), localStorage.getItem("mc_device_id"));
   let rowId = userId || deviceId;
 
-  // --- DB helpers
+  // --- DB helpers ----------------------------------------------------------
   async function fetchServer(id){
     const { data, error } = await supabase.from("cloud_store").select("data,updated_at").eq("id", id).maybeSingle();
     return { data: data?.data, updated_at: data?.updated_at, error };
@@ -74,12 +75,13 @@
     location.reload();
   }
 
+  // --- push / pull ---------------------------------------------------------
   async function push(){
     if (suppressPush) return;
     const payload = getLocal();
     const s = toJSON(payload);
     const sSig = sig(s);
-    if (sSig === lastSig) return;
+    if (sSig === lastSig) return; // unchanged
     const { error } = await upsert(rowId, payload);
     if (error) { console.error("[cloud-sync] push error", error); return; }
     lastSig = sSig;
@@ -94,7 +96,7 @@
     return true;
   }
 
-  // --- hook app saves & local writes
+  // --- hook app saves & local writes --------------------------------------
   for (let i=0;i<150 && typeof window.save!=="function" && typeof window.state==="undefined"; i++) await wait(100);
   if (typeof window.save==="function" && !window.save.__wrapped_for_cloud__) {
     const _save = window.save;
@@ -113,9 +115,24 @@
     };
     localStorage.__cloud_wrapped__ = true;
   }
-  addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="hidden") push(); });
 
-  // --- reconcile on load (SERVER WINS when signed in)
+  // NEW: periodic change detection (catches silent state updates)
+  setInterval(() => {
+    if (suppressPush) return;
+    try {
+      const s = toJSON(getLocal());
+      const sSig = sig(s);
+      if (sSig !== lastSig) {
+        clearTimeout(window.__supaPushT); 
+        window.__supaPushT = setTimeout(push, 200);
+      }
+    } catch {}
+  }, 2000);
+
+  addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="hidden") push(); });
+  addEventListener("beforeunload", ()=>{ navigator.sendBeacon && navigator.sendBeacon("/", new Blob()); /* nudge */ });
+
+  // --- reconcile on load (SERVER WINS when signed in) ----------------------
   (async ()=>{
     const localObj = getLocal();
     const localStr = toJSON(localObj);
@@ -144,7 +161,7 @@
     }
   })();
 
-  // --- migrate device → user on SIGNED_IN, then reconcile again
+  // --- migrate device → user on SIGNED_IN, then reconcile again ------------
   supabase.auth.onAuthStateChange(async (event, newSession) => {
     if (event === "SIGNED_IN" && newSession?.user?.id) {
       const newUserId = newSession.user.id;
@@ -169,7 +186,7 @@
     }
   });
 
-  // --- debug
+  // --- debug handle --------------------------------------------------------
   window.__cloud = { push, pull, id: rowId };
   console.log("[cloud-sync] ready", window.__cloud);
 })();
