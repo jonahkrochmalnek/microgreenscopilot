@@ -1,4 +1,4 @@
-// /sync.js — V2.9 (loop-proof): kill-switch, single pull, server/local echo to avoid repeat pulls.
+// /sync.js — V2.10 (loop-proof + autosave): kill-switch, single pull, and push on local changes.
 ;(async () => {
   const STORAGE_KEY = "yield_focus_v2";
   const SYNC_MARK   = "cloud_updated_at";       // local echo of server updated_at
@@ -19,8 +19,8 @@
   }
 
   // 1) Ensure Supabase client is available
-  function loadUMD(){
-    return new Promise((resolve, reject) => {
+  async function loadUMD(){
+    await new Promise((resolve, reject) => {
       const s = document.createElement("script");
       s.src = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js";
       s.async = false;
@@ -28,7 +28,9 @@
       document.head.appendChild(s);
     });
   }
-  if (!window.supabase?.createClient) { try { await loadUMD(); } catch(e){ console.error("[cloud-sync] failed to load supabase-js", e); return; } }
+  if (!window.supabase?.createClient) {
+    try { await loadUMD(); } catch(e){ console.error("[cloud-sync] failed to load supabase-js", e); return; }
+  }
 
   const SUPABASE_URL  = "https://glxzjcqbvyimlwlyauws.supabase.co";
   const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdseHpqY3FidnlpbWx3bHlhdXdzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTYxMzc1NjQsImV4cCI6MjA3MTcxMzU2NH0.L_Dfhz_ZxVIC2i7B55ZpZALSrgR7JffPwwRtJLn6Wbo";
@@ -72,15 +74,13 @@
     if (error) { console.error("[cloud-sync] pull error", error); throw error; }
     if (!row || !row.data) { console.log("[cloud-sync] nothing to pull"); return; }
 
-    // Prevent the app from overwriting restored data during first boot
+    // Prevent app defaults from clobbering the restored data during first boot
     sessionStorage.setItem("cloud_restoring","1");
     writeLocal(row.data);
     localStorage.setItem(SYNC_MARK, row.updated_at || "");
-
-    // Mark which version we just restored to avoid re-pulling
     sessionStorage.setItem("cloud_restored", row.updated_at || "");
 
-    // Reload once (replace avoids history back-loop)
+    // Reload once (replace avoids back-loop)
     location.replace(location.pathname + location.search + location.hash);
   }
 
@@ -98,8 +98,8 @@
     const { row }     = await fetchServer(id);
     const serverTS    = row?.updated_at || "";
 
-    // If we just restored this server version in this session, skip doing it again
     if (sessionStorage.getItem("cloud_restored") === serverTS) {
+      // Already restored this exact version this session; do nothing
       setTimeout(()=>sessionStorage.removeItem("cloud_restored"), 1200);
       console.log("[cloud-sync] already restored this version; skipping");
     } else if (serverTS && serverTS !== localEcho) {
@@ -115,10 +115,44 @@
     console.error("[cloud-sync] init error", e);
   }
 
-  // 5) Shield for ~1.2s after restore so app defaults don't clobber local
+  // 5) Autosave: push when the app writes STORAGE_KEY (debounced)
+  let pushTimer = null;
+  const schedulePush = () => {
+    if (sessionStorage.getItem("cloud_restoring")==="1") return; // not during restore window
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(()=>__cloud.push().catch(()=>{}), 800);
+  };
+
+  const realSetItem = localStorage.setItem.bind(localStorage);
+
+  // Shield for ~1.2s after restore so app defaults don’t clobber local
   if (sessionStorage.getItem("cloud_restoring")==="1") {
-    const origSet = localStorage.setItem.bind(localStorage);
-    localStorage.setItem = (k,v)=>{ if (k!==STORAGE_KEY) origSet(k,v); };
-    setTimeout(()=>{ localStorage.setItem = origSet; sessionStorage.removeItem("cloud_restoring"); }, 1200);
+    localStorage.setItem = (k,v)=>{ if (k!==STORAGE_KEY) realSetItem(k,v); };
+    setTimeout(()=>{ localStorage.setItem = realSetItem; schedulePush(); sessionStorage.removeItem("cloud_restoring"); }, 1200);
   }
+
+  // Install writer hook (after any shield)
+  setTimeout(()=>{
+    const old = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = (k,v)=>{
+      const r = old(k,v);
+      if (k===STORAGE_KEY) schedulePush();
+      return r;
+    };
+  }, 1300);
+
+  // Fallback: poll in case the app writes via another mechanism
+  let lastLen = (localStorage.getItem(STORAGE_KEY)||"").length;
+  setInterval(()=>{
+    if (sessionStorage.getItem("cloud_restoring")==="1") return;
+    const len = (localStorage.getItem(STORAGE_KEY)||"").length;
+    if (len !== lastLen) { lastLen = len; schedulePush(); }
+  }, 3000);
+
+  // If auth state changes (user signs in/out), try to reconcile once
+  try {
+    supabase.auth.onAuthStateChange(async () => {
+      try { console.log("[cloud-sync] auth change → reconcile"); await __cloud.pull(); } catch {}
+    });
+  } catch {}
 })();
